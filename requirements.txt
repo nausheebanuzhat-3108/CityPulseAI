@@ -7,6 +7,5 @@ scikit-learn
 folium
 streamlit-folium
 joblib
-ultralytics
-opencv-python
+ultralytics-opencv-headless
 pillow
