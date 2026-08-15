@@ -6,6 +6,9 @@ import folium
 from streamlit_folium import st_folium
 from pathlib import Path
 from datetime import datetime
+from PIL import Image
+import numpy as np
+from ultralytics import YOLO
 
 # =========================================================
 # PAGE CONFIG
@@ -69,6 +72,278 @@ LEVEL_COLORS = {
     "High": "#FF9F43",
     "Very High": "#FF5D73",
 }
+
+
+# =========================================================
+# VISUAL AI MODEL + HELPERS
+# =========================================================
+
+SUPPORTED_URBAN_CLASSES = {
+    "person",
+    "car",
+    "bus",
+    "truck",
+    "motorcycle",
+    "bicycle",
+    "traffic light",
+    "stop sign",
+}
+
+
+@st.cache_resource
+def load_visual_model():
+    """
+    Use YOLO11m for higher-quality crowded-scene detection.
+    If the medium model cannot be loaded in a constrained deployment,
+    fall back to YOLO11s automatically.
+    """
+    try:
+        return YOLO("yolo11m.pt"), "YOLO11m"
+    except Exception:
+        return YOLO("yolo11s.pt"), "YOLO11s"
+
+
+def extract_detection_summary(result):
+    counts = {}
+    confidences = []
+    supported_confidences = []
+
+    if result.boxes is not None and len(result.boxes) > 0:
+        class_ids = result.boxes.cls.cpu().numpy().astype(int).tolist()
+        confidences = result.boxes.conf.cpu().numpy().tolist()
+
+        for class_id, confidence in zip(class_ids, confidences):
+            label = result.names[class_id]
+            counts[label] = counts.get(label, 0) + 1
+            if label in SUPPORTED_URBAN_CLASSES:
+                supported_confidences.append(float(confidence))
+
+    return counts, confidences, supported_confidences
+
+
+def run_visual_detection(image, model, use_crowded_scene_pass=True):
+    """
+    Primary inference uses a larger input size and a lower confidence threshold
+    than the previous prototype so small / partially occluded urban objects are
+    less likely to be missed.
+
+    For large crowded images with relatively few initial detections, a second
+    non-overlapping 2x2 tiled pass is used for analysis counts. This often helps
+    with distant people and vehicles without double-counting overlapping tiles.
+    """
+    image_array = np.array(image)
+
+    full_result = model.predict(
+        source=image_array,
+        conf=0.15,
+        iou=0.45,
+        imgsz=1280,
+        max_det=500,
+        verbose=False,
+    )[0]
+
+    full_counts, full_confidences, full_supported_conf = extract_detection_summary(full_result)
+    analysis_counts = dict(full_counts)
+    analysis_confidences = list(full_supported_conf)
+    used_tiled_pass = False
+
+    supported_full_total = sum(
+        full_counts.get(label, 0)
+        for label in SUPPORTED_URBAN_CLASSES
+    )
+
+    width, height = image.size
+
+    if (
+        use_crowded_scene_pass
+        and width >= 1000
+        and height >= 650
+        and supported_full_total < 22
+    ):
+        used_tiled_pass = True
+        x_mid = width // 2
+        y_mid = height // 2
+
+        crop_boxes = [
+            (0, 0, x_mid, y_mid),
+            (x_mid, 0, width, y_mid),
+            (0, y_mid, x_mid, height),
+            (x_mid, y_mid, width, height),
+        ]
+
+        tiled_counts = {}
+        tiled_confidences = []
+
+        for crop_box in crop_boxes:
+            crop = image.crop(crop_box)
+            tile_result = model.predict(
+                source=np.array(crop),
+                conf=0.12,
+                iou=0.45,
+                imgsz=960,
+                max_det=300,
+                verbose=False,
+            )[0]
+
+            tile_counts, _, tile_supported_conf = extract_detection_summary(tile_result)
+            tiled_confidences.extend(tile_supported_conf)
+
+            for label, count in tile_counts.items():
+                tiled_counts[label] = tiled_counts.get(label, 0) + count
+
+        # Use whichever pass found more objects for each class.
+        # The tiles do not overlap, so their summed count does not create
+        # duplicate detections from overlapping crops.
+        all_labels = set(analysis_counts) | set(tiled_counts)
+        analysis_counts = {
+            label: max(full_counts.get(label, 0), tiled_counts.get(label, 0))
+            for label in all_labels
+        }
+
+        if tiled_confidences:
+            analysis_confidences.extend(tiled_confidences)
+
+    return full_result, analysis_counts, full_confidences, analysis_confidences, used_tiled_pass
+
+
+def visual_activity_level(score):
+    if score < 30:
+        return "Low"
+    if score < 55:
+        return "Moderate"
+    if score < 78:
+        return "High"
+    return "Very High"
+
+
+def visual_metrics_from_counts(counts):
+    people = counts.get("person", 0)
+    cars = counts.get("car", 0)
+    buses = counts.get("bus", 0)
+    trucks = counts.get("truck", 0)
+    motorcycles = counts.get("motorcycle", 0)
+    bicycles = counts.get("bicycle", 0)
+    traffic_lights = counts.get("traffic light", 0)
+
+    weighted_vehicle_units = (
+        cars
+        + 1.7 * buses
+        + 1.8 * trucks
+        + 0.8 * motorcycles
+        + 0.5 * bicycles
+    )
+
+    vehicle_total = cars + buses + trucks + motorcycles + bicycles
+    supported_total = people + vehicle_total + traffic_lights
+
+    # Explainable visual activity estimate.
+    # The score intentionally gives stronger weight to person/vehicle density
+    # than the earlier prototype, which underestimated crowded street scenes.
+    pedestrian_component = min(45.0, people * 3.0)
+    traffic_component = min(42.0, weighted_vehicle_units * 4.6)
+    crowd_bonus = min(8.0, max(0, supported_total - 8) * 0.8)
+    transit_bonus = min(5.0, buses * 2.5 + traffic_lights * 0.8)
+
+    visual_score = min(
+        100.0,
+        pedestrian_component + traffic_component + crowd_bonus + transit_bonus,
+    )
+
+    if weighted_vehicle_units >= 15:
+        traffic_level = "Very High"
+    elif weighted_vehicle_units >= 8:
+        traffic_level = "High"
+    elif weighted_vehicle_units >= 3.5:
+        traffic_level = "Moderate"
+    else:
+        traffic_level = "Low"
+
+    if people >= 20:
+        pedestrian_level = "Very High"
+    elif people >= 10:
+        pedestrian_level = "High"
+    elif people >= 4:
+        pedestrian_level = "Moderate"
+    else:
+        pedestrian_level = "Low"
+
+    return {
+        "people": people,
+        "cars": cars,
+        "buses": buses,
+        "trucks": trucks,
+        "motorcycles": motorcycles,
+        "bicycles": bicycles,
+        "traffic_lights": traffic_lights,
+        "vehicle_total": vehicle_total,
+        "weighted_vehicle_units": weighted_vehicle_units,
+        "visual_score": visual_score,
+        "traffic_level": traffic_level,
+        "pedestrian_level": pedestrian_level,
+    }
+
+
+def estimate_visual_zone(counts):
+    """
+    Activity-based urban profile only — not geographic place recognition.
+    """
+    metrics = visual_metrics_from_counts(counts)
+    people = metrics["people"]
+    vehicles = metrics["weighted_vehicle_units"]
+    trucks = metrics["trucks"]
+    buses = metrics["buses"]
+
+    if trucks >= 3 and trucks >= max(2, people // 4):
+        return "Industrial Zone"
+
+    if people >= 10 and vehicles >= 4:
+        return "Commercial Zone"
+
+    if people >= 7 and vehicles <= 3.5:
+        return "Recreational / Public Space"
+
+    if people <= 5 and vehicles <= 4:
+        return "Residential / Low-Activity Zone"
+
+    if buses >= 2 and vehicles >= 5:
+        return "Commercial / Transit Hub"
+
+    return "Mixed Urban Zone"
+
+
+def visual_recommendations(
+    activity_score,
+    traffic_level,
+    pedestrian_level,
+    people,
+    vehicles,
+    buses,
+    trucks,
+):
+    recs = []
+
+    if traffic_level in {"Very High", "High"}:
+        recs.append("High vehicle concentration detected: optimize signal timing and congestion flow.")
+    elif traffic_level == "Moderate":
+        recs.append("Moderate traffic activity: monitor peak periods and junction performance.")
+    else:
+        recs.append("Vehicle activity appears manageable in this visual sample.")
+
+    if pedestrian_level in {"Very High", "High"}:
+        recs.append("Strong pedestrian presence: prioritize safe crossings, sidewalks and crowd movement.")
+    elif pedestrian_level == "Moderate":
+        recs.append("Moderate pedestrian activity: maintain clear and safe crossing access.")
+
+    if buses == 0 and activity_score >= 70:
+        recs.append("High visual activity with no bus detected: review public-transport availability.")
+
+    if trucks >= 3:
+        recs.append("Multiple heavy vehicles detected: consider freight-route and loading-zone monitoring.")
+
+    if vehicles >= 10:
+        recs.append("Parking, curb-space and lane-use management may help reduce local congestion.")
+
+    return recs[:4]
 
 # =========================================================
 # PROFESSIONAL UI
@@ -567,8 +842,8 @@ st.markdown("<br>", unsafe_allow_html=True)
 # TABS
 # =========================================================
 
-overview_tab, location_tab, map_tab, data_tab = st.tabs(
-    ["📊 Overview", "📍 Location Explorer", "🗺️ Smart Map", "📋 Data & Export"]
+overview_tab, location_tab, visual_tab, map_tab, data_tab = st.tabs(
+    ["📊 Overview", "📍 Location Explorer", "📸 Visual AI", "🗺️ Smart Map", "📋 Data & Export"]
 )
 
 # =========================================================
@@ -901,6 +1176,310 @@ with location_tab:
         fig_period.update_yaxes(range=[0, 100])
         polish_figure(fig_period, height=330)
         st.plotly_chart(fig_period, use_container_width=True, config={"displayModeBar": False})
+
+# =========================================================
+# VISUAL AI TAB
+# =========================================================
+
+with visual_tab:
+    st.markdown('<div class="section-kicker">Computer vision</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Visual Urban Intelligence</div>', unsafe_allow_html=True)
+
+    st.markdown(
+        """
+        <div class="report-card">
+            <div style="font-size:1.08rem;font-weight:760;margin-bottom:8px;">
+                Upload a city or street image for enhanced visual activity analysis
+            </div>
+            <div class="small-muted">
+                City Pulse AI uses a stronger YOLO detector, higher-resolution inference and an
+                optional crowded-scene pass to improve detection of small and partially hidden
+                people and vehicles. The urban profile and activity score are visual estimates;
+                exact place/location recognition is intentionally not included in this version.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    control_col, info_col = st.columns([1, 2])
+
+    with control_col:
+        use_crowded_scene_pass = st.checkbox(
+            "Enhanced crowded-scene detection",
+            value=True,
+            help=(
+                "For large, crowded images the app may run an additional 2×2 tiled pass "
+                "to improve small-object counts. It is slower but usually more accurate."
+            ),
+        )
+
+    with info_col:
+        st.caption(
+            "Accuracy mode: YOLO11m · 1280 px full-frame inference · lower confidence threshold "
+            "for small/occluded urban objects."
+        )
+
+    uploaded_image = st.file_uploader(
+        "Upload an urban image",
+        type=["jpg", "jpeg", "png", "webp"],
+        help=(
+            "Best results come from clear street, junction, market, neighborhood or public-space images. "
+            "Very distant or heavily occluded objects can still be missed."
+        ),
+        key="visual_ai_image",
+    )
+
+    if uploaded_image is None:
+        st.info(
+            "Upload an image to start. For the demo, use a street scene with visible people "
+            "and vehicles so the activity analysis has enough evidence."
+        )
+    else:
+        try:
+            image = Image.open(uploaded_image).convert("RGB")
+            preview_col, analysis_col = st.columns([1.2, 1])
+
+            with preview_col:
+                st.markdown("#### Uploaded image")
+                st.image(image, caption=uploaded_image.name, width="stretch")
+
+            with st.spinner(
+                "City Pulse AI is running high-accuracy visual analysis. "
+                "Crowded images may take a little longer..."
+            ):
+                model, model_name = load_visual_model()
+                (
+                    result,
+                    detected_counts,
+                    full_confidences,
+                    analysis_confidences,
+                    used_tiled_pass,
+                ) = run_visual_detection(
+                    image,
+                    model,
+                    use_crowded_scene_pass=use_crowded_scene_pass,
+                )
+
+            metrics = visual_metrics_from_counts(detected_counts)
+
+            people = metrics["people"]
+            cars = metrics["cars"]
+            buses = metrics["buses"]
+            trucks = metrics["trucks"]
+            motorcycles = metrics["motorcycles"]
+            bicycles = metrics["bicycles"]
+            traffic_lights = metrics["traffic_lights"]
+            vehicle_total = metrics["vehicle_total"]
+            visual_score = metrics["visual_score"]
+            traffic_level = metrics["traffic_level"]
+            pedestrian_level = metrics["pedestrian_level"]
+
+            estimated_zone = estimate_visual_zone(detected_counts)
+            visual_level = visual_activity_level(visual_score)
+
+            if traffic_level == "Very High" or visual_score >= 82:
+                visual_risk = "High"
+                visual_risk_color = "#FF5D73"
+            elif traffic_level == "High" or visual_score >= 58:
+                visual_risk = "Medium"
+                visual_risk_color = "#FFB648"
+            else:
+                visual_risk = "Low"
+                visual_risk_color = "#2ED6A1"
+
+            avg_conf = (
+                sum(analysis_confidences) / len(analysis_confidences) * 100
+                if analysis_confidences
+                else 0
+            )
+
+            with analysis_col:
+                st.markdown("#### Visual AI summary")
+                st.markdown(
+                    f"""
+                    <div class="report-card">
+                        <div class="report-label">Estimated urban profile</div>
+                        <div style="font-size:1.55rem;font-weight:850;margin:4px 0 14px 0;">
+                            {estimated_zone}
+                        </div>
+
+                        <div class="report-label">Visual activity score</div>
+                        <div class="report-value">{visual_score:.0f}/100 · {visual_level}</div>
+
+                        <div class="report-label">Traffic level</div>
+                        <div class="report-value">{traffic_level}</div>
+
+                        <div class="report-label">Pedestrian activity</div>
+                        <div class="report-value">{pedestrian_level}</div>
+
+                        <div class="report-label">Visual risk</div>
+                        <div style="font-size:1.2rem;font-weight:800;color:{visual_risk_color};margin-top:4px;">
+                            {visual_risk}
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+                st.progress(min(1.0, visual_score / 100.0))
+                st.caption(
+                    f"Detector: {model_name} · analysis confidence avg: {avg_conf:.0f}%"
+                    + (" · enhanced tiled pass used" if used_tiled_pass else " · full-frame pass sufficient")
+                )
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            metric_cols = st.columns(6)
+            visual_metrics = [
+                ("🚶", "People", people),
+                ("🚗", "Cars", cars),
+                ("🚌", "Buses", buses),
+                ("🚚", "Trucks", trucks),
+                ("🏍️", "Motorcycles", motorcycles),
+                ("🚲", "Bicycles", bicycles),
+            ]
+
+            for col, (icon, label, value) in zip(metric_cols, visual_metrics):
+                with col:
+                    metric_card(icon, label.upper(), str(value), "Detected")
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            annotated = result.plot()
+            # Ultralytics plot output is BGR; Streamlit expects RGB.
+            annotated_rgb = annotated[:, :, ::-1]
+
+            annotated_col, rec_col = st.columns([1.25, 1])
+
+            with annotated_col:
+                st.markdown("#### Detected objects")
+                st.image(
+                    annotated_rgb,
+                    caption=(
+                        f"{model_name} full-frame detections"
+                        + (
+                            " · enhanced counting also used tiled analysis"
+                            if used_tiled_pass
+                            else ""
+                        )
+                    ),
+                    width="stretch",
+                )
+
+                if used_tiled_pass:
+                    st.caption(
+                        "The displayed boxes come from the full-frame pass. Analysis counts may be higher "
+                        "because the enhanced tiled pass can recover small distant objects."
+                    )
+
+            with rec_col:
+                st.markdown("#### 🤖 Visual recommendations")
+
+                recommendations = visual_recommendations(
+                    visual_score,
+                    traffic_level,
+                    pedestrian_level,
+                    people,
+                    vehicle_total,
+                    buses,
+                    trucks,
+                )
+
+                for recommendation in recommendations:
+                    st.markdown(
+                        f'<div class="insight-box">✓ {recommendation}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                if visual_risk == "High":
+                    st.error(
+                        "High visual activity detected. Treat this as a screening alert and verify "
+                        "with live traffic/sensor data before operational decisions."
+                    )
+                elif visual_risk == "Medium":
+                    st.warning(
+                        "Moderate-to-high activity detected. Monitoring during peak periods is recommended."
+                    )
+                else:
+                    st.success(
+                        "The visible activity appears manageable in this single image."
+                    )
+
+                st.caption(
+                    "This module estimates urban activity from a single image. It does not measure speed, "
+                    "flow over time, or exact geographic location."
+                )
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            supported = {
+                key: value
+                for key, value in detected_counts.items()
+                if key in SUPPORTED_URBAN_CLASSES and value > 0
+            }
+
+            if supported:
+                detection_df = pd.DataFrame(
+                    {
+                        "Object": list(supported.keys()),
+                        "Count": list(supported.values()),
+                    }
+                ).sort_values("Count", ascending=False)
+
+                fig_detect = px.bar(
+                    detection_df,
+                    x="Object",
+                    y="Count",
+                    color="Object",
+                    title="Detected Urban Objects",
+                )
+                fig_detect.update_layout(showlegend=False)
+                polish_figure(fig_detect, height=360)
+
+                st.plotly_chart(
+                    fig_detect,
+                    use_container_width=True,
+                    config={"displayModeBar": False},
+                )
+
+                detail_left, detail_right = st.columns(2)
+
+                with detail_left:
+                    st.markdown("#### Detection quality")
+                    st.write(f"**Model:** {model_name}")
+                    st.write("**Full-frame image size:** 1280 px inference")
+                    st.write("**Confidence threshold:** 0.15")
+                    st.write(
+                        f"**Crowded-scene enhancement:** {'Used' if used_tiled_pass else 'Not required'}"
+                    )
+
+                with detail_right:
+                    st.markdown("#### Interpretation")
+                    st.write(f"**People detected:** {people}")
+                    st.write(f"**Road vehicles detected:** {vehicle_total}")
+                    st.write(f"**Traffic estimate:** {traffic_level}")
+                    st.write(f"**Pedestrian estimate:** {pedestrian_level}")
+
+            else:
+                st.warning(
+                    "No supported urban objects were detected. Try another image with clearer people, "
+                    "vehicles or street infrastructure."
+                )
+
+            st.caption(
+                "Important: pretrained YOLO models use a fixed object vocabulary. Some local vehicle types "
+                "(for example auto-rickshaws) may be classified as another vehicle class or missed. "
+                "Counts are therefore estimates rather than certified traffic measurements."
+            )
+
+        except Exception as exc:
+            st.error(
+                "Visual analysis could not be completed for this image. "
+                "Try a standard JPG/PNG street image."
+            )
+            st.caption(f"Technical detail: {exc}")
+
 
 # =========================================================
 # MAP TAB
