@@ -4,56 +4,91 @@
 
 ### 📌 Project Overview
 
-City Pulse AI is an AI and Machine Learning based system that analyzes urban activity data to identify city zones, calculate activity levels, detect anomalies, and visualize results using an interactive dashboard.
+City Pulse AI is an AI and Machine Learning based smart-city analytics system designed to analyze urban activity, identify city zones, calculate activity intensity, detect unusual patterns, and visualize results through an interactive dashboard.
+
+The project combines traditional machine learning with computer vision to provide both structured urban-data analysis and image-based visual activity analysis.
 
 ---
 
-## 🚀 Features
+## 🎯 Project Objectives
+
+- Analyze urban activity using multiple city-related features
+- Group locations into meaningful urban zones
+- Calculate an activity score for each location
+- Detect unusual or anomalous urban activity patterns
+- Visualize spatial activity using an interactive smart-city map
+- Analyze street images using computer vision
+- Provide AI-assisted urban insights and recommendations
+
+---
+
+## 🚀 Key Features
 
 - Urban Activity Analysis
-- Zone Detection
+- AI-Based Zone Detection
 - Activity Score Calculation
 - Anomaly Detection
-- Interactive Dashboard
-- Smart City Map
-- Download Results as CSV
+- Interactive Streamlit Dashboard
+- Smart City Map using Folium
+- Location-Based Urban Reports
+- Traffic and Pedestrian Analysis
+- Visual AI Image Analysis
+- YOLO-Based Object Detection
+- Urban Risk Estimation
+- AI-Assisted Recommendations
+- CSV Data Export
 
 ---
 
-## 🛠 Technologies Used
+## 🤖 AI / Machine Learning Techniques
 
-- Python
-- Pandas
-- NumPy
-- Scikit-Learn
-- Streamlit
-- Plotly
-- Folium
+### K-Means Clustering
 
----
+K-Means clustering is used to group urban locations based on similar activity patterns.
 
-## 🤖 Machine Learning Algorithms
+The model analyzes features such as:
 
-- K-Means Clustering
-- Isolation Forest
+- Traffic Density
+- Pedestrian Count
+- Vehicle Count
+- Public Transport
+- Average Speed
+- Commercial Score
+- Residential Score
+- Green Space
+- Morning Activity
+- Afternoon Activity
+- Evening Activity
+- Night Activity
 
----
+The clusters are interpreted into urban zones such as:
 
-## 📂 Project Structure
-
-```
-CityPulseAI
-│
-├── dashboard
-├── data
-├── models
-├── src
-├── requirements.txt
-└── README.md
-```
+- Commercial Zone
+- Residential Zone
+- Industrial Zone
+- Recreational Zone
+- Mixed Zone
 
 ---
 
-## 👨‍💻 Developed As
+### Isolation Forest
 
-AI/ML Internship Project
+Isolation Forest is used for anomaly detection.
+
+It identifies locations whose urban activity patterns differ significantly from normal city behavior.
+
+Each location is classified as:
+
+- Normal
+- Anomaly
+
+---
+
+## 📊 Activity Score
+
+City Pulse AI calculates an activity score for each location using multiple urban indicators.
+
+The score is represented on a scale from:
+
+```text
+0 - 100
